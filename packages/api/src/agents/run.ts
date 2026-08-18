@@ -19,6 +19,7 @@ import type {
   LCToolRegistry,
   SubagentConfig,
   SubagentResolveContext,
+  SubagentConfigEntry,
   HookCallback,
   AgentInputs,
   GenericTool,
@@ -31,12 +32,14 @@ import type {
   TAgentsEndpoint,
   AgentModelParameters,
   AgentSubagentsConfig,
+  AgentSubagentGraph,
   ReasoningResponseKey,
   SummarizationConfig,
 } from 'librechat-data-provider';
 import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { AppConfig, IUser } from '@librechat/data-schemas';
 import type { ToolInputValidationError } from '~/agents/toolValidation';
+import type { ResolvedAlwaysApplySkill } from '~/agents/skills';
 import type { SubagentUsageEvent } from '~/agents/usage';
 import type * as t from '~/types';
 import {
@@ -55,10 +58,12 @@ import { isSteeringSupported, isSteerPreemptSupported } from '~/agents/steering/
 import { getLLMConfig as getAnthropicLLMConfig } from '~/endpoints/anthropic/llm';
 import { resolveStreamLimits, resolveSubagentMaxTurns } from '~/agents/config';
 import { CREATE_FILE_TOOL_NAME, EDIT_FILE_TOOL_NAME } from '~/agents/tools';
+import { buildAgentInitialToolSessions } from '~/agents/codeFilesSession';
 import { getProviderConfig } from '~/endpoints/config/providers';
 import { extractDefaultParams } from '~/endpoints/openai/llm';
 import { resolveHeaders, createSafeUser } from '~/utils/env';
 import { getAgentCheckpointer } from '~/agents/checkpointer';
+import { getPluginHookSource } from '~/agents/hooks/source';
 import { getOpenAIConfig } from '~/endpoints/openai/config';
 import { buildHITLRunWiring } from '~/agents/hitl/runtime';
 import { buildLangfuseConfig } from '~/langfuse/config';
@@ -382,9 +387,13 @@ type RunAgent = Omit<Agent, 'tools'> & {
   /**
    * Per-agent stateful-session gate set by `initializeAgent`: the admin
    * `stateful_code_sessions` capability AND the agent's builder opt-in AND
-   * `codeEnvAvailable`. Walked here to gate `toolExecution.sandbox`.
+   * `codeEnvAvailable`. Carried into per-agent tool loading and prewarming.
    */
   statefulCodeSessions?: boolean;
+  /** Per-agent stateful workspace sharing scope. */
+  statefulCodeEnvironment?: Agent['stateful_code_environment'];
+  /** Trusted partition for transient code session ids and file references. */
+  codeSessionKey?: string;
   /** Optional per-agent summarization overrides */
   summarization?: SummarizationConfig;
   /** Response field to read model reasoning from for custom OpenAI-compatible endpoints. */
@@ -404,6 +413,13 @@ type RunAgent = Omit<Agent, 'tools'> & {
    * may use the active request's authorization and tool-loading context.
    */
   lazySubagentConfigs?: LazySubagentAgent[];
+  /** All-or-nothing saved-agent teams resolved by initialize.js. */
+  subagentGraphConfigs?: Array<{
+    definition: AgentSubagentGraph;
+    memberConfigs: RunAgent[];
+  }>;
+  /** Member-scoped always-apply skills resolved during agent initialization. */
+  alwaysApplySkillPrimes?: ResolvedAlwaysApplySkill[];
   /** Source subagent spawning configuration (enabled / allowSelf / agent_ids). */
   subagents?: AgentSubagentsConfig;
 };
@@ -420,11 +436,15 @@ type LazySubagentAgent = Pick<
   | 'subagents'
   | 'codeEnvAvailable'
   | 'statefulCodeSessions'
+  | 'statefulCodeEnvironment'
+  | 'codeSessionKey'
   | 'includeReasoningHistory'
 > & {
   configId: string;
   subagentAgentConfigs?: RunAgent[];
   lazySubagentConfigs?: LazySubagentAgent[];
+  /** Lightweight graph-member metadata used only by run-wide capability gates. */
+  subagentGraphMemberMetadata?: SubagentTreeNode[];
   resolve: (context: SubagentResolveContext) => Promise<RunAgent>;
 };
 
@@ -436,10 +456,14 @@ type SubagentTreeNode = Pick<
   | 'model_parameters'
   | 'codeEnvAvailable'
   | 'statefulCodeSessions'
+  | 'statefulCodeEnvironment'
+  | 'codeSessionKey'
   | 'includeReasoningHistory'
 > & {
   subagentAgentConfigs?: SubagentTreeNode[];
   lazySubagentConfigs?: SubagentTreeNode[];
+  subagentGraphMemberMetadata?: SubagentTreeNode[];
+  subagentGraphConfigs?: Array<{ memberConfigs: SubagentTreeNode[] }>;
 };
 
 function isNonEmptyString(value: unknown): value is string {
@@ -784,40 +808,13 @@ function assertSubagentDepth(depth: number, agentId: string): void {
   }
 }
 
-function buildIsolatedSubagentInputs(
-  child: RunAgent,
-  toInput: (child: RunAgent, opts?: { isSubagent?: boolean }) => AgentInputs,
-): AgentInputs {
-  const childInputs = toInput(child, { isSubagent: true });
-  if ((child.backgroundToolNames?.length ?? 0) > 0) {
-    childInputs.toolDefinitions = stripBackgroundFromToolDefinitions(
-      childInputs.toolDefinitions,
-      child.backgroundToolNames,
-    );
-    childInputs.toolRegistry = stripBackgroundFromToolRegistry(
-      childInputs.toolRegistry,
-      child.backgroundToolNames,
-    );
-  }
-  if ((child.intentToolNames?.length ?? 0) > 0) {
-    childInputs.toolDefinitions = stripIntentFromToolDefinitions(
-      childInputs.toolDefinitions,
-      child.intentToolNames,
-    );
-    childInputs.toolRegistry = stripIntentFromToolRegistry(
-      childInputs.toolRegistry,
-      child.intentToolNames,
-    );
-  }
-  return childInputs;
-}
-
 function createLazySubagentConfig(
   child: LazySubagentAgent,
   toInput: (child: RunAgent, opts?: { isSubagent?: boolean }) => AgentInputs,
   agentsEConfig: Partial<TAgentsEndpoint> | undefined,
   ancestors: Set<string>,
   depth: number,
+  prebuiltGraphInputs?: ReadonlyMap<string, AgentInputs>,
 ): SubagentConfig {
   return {
     type: child.id,
@@ -836,7 +833,7 @@ function createLazySubagentConfig(
       if (context.signal.aborted) {
         throw context.signal.reason ?? new Error('Subagent resolution was aborted.');
       }
-      const childInputs = buildIsolatedSubagentInputs(resolvedChild, toInput);
+      const childInputs = buildIsolatedAgentInputs(resolvedChild, toInput);
       const resolutionState: SubagentBuildState = {
         configCount: 1,
         rootAgentIds: [resolvedChild.id],
@@ -849,6 +846,7 @@ function createLazySubagentConfig(
         agentsEConfig,
         ancestors,
         depth,
+        prebuiltGraphInputs,
       );
       if (grandchildConfigs.length > 0) {
         childInputs.subagentConfigs = grandchildConfigs;
@@ -856,6 +854,41 @@ function createLazySubagentConfig(
       return childInputs;
     },
   };
+}
+
+function enqueueSubagentChildren(
+  agent: SubagentTreeNode,
+  pending: Array<SubagentTreeNode | null | undefined>,
+  visited: ReadonlySet<string>,
+  includeLazyDescriptors = true,
+  includeCapabilityMetadata = true,
+): void {
+  for (const child of agent.subagentAgentConfigs ?? []) {
+    if (child != null && !visited.has(child.id)) {
+      pending.push(child);
+    }
+  }
+  if (includeLazyDescriptors) {
+    for (const child of agent.lazySubagentConfigs ?? []) {
+      if (!visited.has(child.id)) {
+        pending.push(child);
+      }
+    }
+  }
+  if (includeCapabilityMetadata) {
+    for (const member of agent.subagentGraphMemberMetadata ?? []) {
+      if (!visited.has(member.id)) {
+        pending.push(member);
+      }
+    }
+  }
+  for (const graph of agent.subagentGraphConfigs ?? []) {
+    for (const member of graph.memberConfigs) {
+      if (member != null && !visited.has(member.id)) {
+        pending.push(member);
+      }
+    }
+  }
 }
 
 /**
@@ -888,16 +921,7 @@ function anyAgentHasCodeEnv(agents: RunAgent[]): boolean {
     if (agent.codeEnvAvailable === true) {
       return true;
     }
-    for (const child of agent.subagentAgentConfigs ?? []) {
-      if (!visited.has(child.id)) {
-        pending.push(child);
-      }
-    }
-    for (const child of agent.lazySubagentConfigs ?? []) {
-      if (!visited.has(child.id)) {
-        pending.push(child);
-      }
-    }
+    enqueueSubagentChildren(agent, pending, visited);
   }
   return false;
 }
@@ -946,44 +970,6 @@ function isAskUserQuestionAdminDisabled(appConfig?: AppConfig): boolean {
 
 /**
  * Whether any agent reachable in the run — primary, handoff/parallel, or a
- * nested subagent — resolved `statefulCodeSessions` during initialization
- * (admin `stateful_code_sessions` capability AND the agent's builder opt-in
- * AND a working code env). Walks `subagentAgentConfigs` like
- * {@link anyAgentHasCodeEnv}; when true, `createRun` opts the run's remote
- * sandbox tools into stateful runtime sessions via `toolExecution.sandbox`.
- * Off by default: the capability is absent from `defaultAgentCapabilities`,
- * agents opt in individually, and the SDK derives the session hint from
- * `thread_id` (= conversationId), so this is never a trust boundary.
- */
-export function anyAgentHasStatefulSessions(agents: Array<RunAgent | null | undefined>): boolean {
-  const visited = new Set<string>();
-  const pending: Array<SubagentTreeNode | null | undefined> = [...agents];
-
-  for (let index = 0; index < pending.length; index++) {
-    const agent = pending[index];
-    if (agent == null || visited.has(agent.id)) {
-      continue;
-    }
-    visited.add(agent.id);
-    if (agent.statefulCodeSessions === true) {
-      return true;
-    }
-    for (const child of agent.subagentAgentConfigs ?? []) {
-      if (child != null && !visited.has(child.id)) {
-        pending.push(child);
-      }
-    }
-    for (const child of agent.lazySubagentConfigs ?? []) {
-      if (!visited.has(child.id)) {
-        pending.push(child);
-      }
-    }
-  }
-  return false;
-}
-
-/**
- * Whether any agent reachable in the run — primary, handoff/parallel, or a
  * nested subagent — opts into cross-turn `reasoning_content` reconstruction.
  * Walks `subagentAgentConfigs` like {@link anyAgentHasCodeEnv}, since an
  * opted-in custom endpoint may appear only as a (possibly pruned) subagent.
@@ -1003,16 +989,7 @@ export function anyAgentReplaysReasoningContent(
     if (shouldReplayReasoningContent(agent)) {
       return true;
     }
-    for (const child of agent.subagentAgentConfigs ?? []) {
-      if (!visited.has(child.id)) {
-        pending.push(child);
-      }
-    }
-    for (const child of agent.lazySubagentConfigs ?? []) {
-      if (!visited.has(child.id)) {
-        pending.push(child);
-      }
-    }
+    enqueueSubagentChildren(agent, pending, visited);
   }
   return false;
 }
@@ -1022,6 +999,43 @@ export function anyAgentReplaysReasoningContent(
  * explicit eager children and inert lazy descriptors. Returns an empty array
  * when subagents are disabled or no spawn targets are available.
  */
+function buildIsolatedAgentInputs(
+  child: RunAgent,
+  toInput: (agent: RunAgent, opts?: { isSubagent?: boolean }) => AgentInputs,
+): AgentInputs {
+  const childInputs = toInput(child, { isSubagent: true });
+  const alwaysApplySkillPrimes = child.alwaysApplySkillPrimes;
+  if (alwaysApplySkillPrimes && alwaysApplySkillPrimes.length > 0) {
+    const skillInstructions = alwaysApplySkillPrimes
+      .map((prime) => `# Always-apply skill: ${prime.name}\n${prime.body}`)
+      .join('\n\n');
+    childInputs.additional_instructions = [childInputs.additional_instructions, skillInstructions]
+      .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      .join('\n\n');
+  }
+  if ((child.backgroundToolNames?.length ?? 0) > 0) {
+    childInputs.toolDefinitions = stripBackgroundFromToolDefinitions(
+      childInputs.toolDefinitions,
+      child.backgroundToolNames,
+    );
+    childInputs.toolRegistry = stripBackgroundFromToolRegistry(
+      childInputs.toolRegistry,
+      child.backgroundToolNames,
+    );
+  }
+  if ((child.intentToolNames?.length ?? 0) > 0) {
+    childInputs.toolDefinitions = stripIntentFromToolDefinitions(
+      childInputs.toolDefinitions,
+      child.intentToolNames,
+    );
+    childInputs.toolRegistry = stripIntentFromToolRegistry(
+      childInputs.toolRegistry,
+      child.intentToolNames,
+    );
+  }
+  return childInputs;
+}
+
 function buildSubagentConfigs(
   agent: RunAgent,
   agentInput: AgentInputs,
@@ -1030,12 +1044,13 @@ function buildSubagentConfigs(
   agentsEConfig: Partial<TAgentsEndpoint> | undefined,
   ancestors: Set<string> = new Set(),
   depth = 0,
-): SubagentConfig[] {
+  prebuiltGraphInputs?: ReadonlyMap<string, AgentInputs>,
+): SubagentConfigEntry[] {
   if (!agent.subagents?.enabled) {
     return [];
   }
 
-  const configs: SubagentConfig[] = [];
+  const configs: SubagentConfigEntry[] = [];
   const allowSelf = agent.subagents.allowSelf !== false;
 
   if (allowSelf) {
@@ -1098,7 +1113,7 @@ function buildSubagentConfigs(
     const childDepth = depth + 1;
     assertSubagentDepth(childDepth, child.id);
     countSubagentConfig(state);
-    const childInputs = buildIsolatedSubagentInputs(child, toInput);
+    const childInputs = buildIsolatedAgentInputs(child, toInput);
     /**
      * Recursively resolve the child's own spawn targets so multi-level
      * delegation (A → B → C) works. Without this, a child whose own
@@ -1115,6 +1130,7 @@ function buildSubagentConfigs(
       agentsEConfig,
       nextAncestors,
       childDepth,
+      prebuiltGraphInputs,
     );
     if (grandchildConfigs.length > 0) {
       childInputs.subagentConfigs = grandchildConfigs;
@@ -1141,8 +1157,51 @@ function buildSubagentConfigs(
     assertSubagentDepth(childDepth, child.id);
     countSubagentConfig(state);
     configs.push(
-      createLazySubagentConfig(child, toInput, agentsEConfig, nextAncestors, childDepth),
+      createLazySubagentConfig(
+        child,
+        toInput,
+        agentsEConfig,
+        nextAncestors,
+        childDepth,
+        prebuiltGraphInputs,
+      ),
     );
+  }
+
+  for (const { definition, memberConfigs } of agent.subagentGraphConfigs ?? []) {
+    if (memberConfigs.length === 0) {
+      continue;
+    }
+    countSubagentConfig(state);
+    const maxTurns = Math.min(
+      ...memberConfigs.map((member) => resolveSubagentMaxTurns(agentsEConfig, member)),
+    );
+    configs.push({
+      kind: 'graph',
+      type: definition.type,
+      name: definition.name,
+      description: definition.description,
+      agents: memberConfigs.map(
+        (member) =>
+          prebuiltGraphInputs?.get(member.id) ?? buildIsolatedAgentInputs(member, toInput),
+      ),
+      /**
+       * The persisted API accepts `excludeResults: false` as the explicit
+       * form of the default. The SDK reserves this field for prompted edges
+       * and rejects any defined value when no prompt exists, so erase the
+       * no-op false value at the host boundary.
+       */
+      edges: definition.edges.map((edge) => {
+        if (edge.excludeResults !== false) {
+          return edge;
+        }
+        const { excludeResults: _excludeResults, ...normalizedEdge } = edge;
+        return normalizedEdge;
+      }),
+      entryAgentId: definition.entry_agent_id,
+      resultAgentId: definition.result_agent_id,
+      maxTurns,
+    });
   }
 
   return configs;
@@ -1187,6 +1246,7 @@ export async function createRun({
   activityPhase,
   hitlCapable = false,
   toolInputValidationErrors,
+  sessionStartSource,
   streaming = true,
   streamUsage = true,
 }: {
@@ -1274,6 +1334,8 @@ export async function createRun({
    * final response / `[DONE]` with the tool call left unresolved).
    */
   hitlCapable?: boolean;
+  /** Plugin-hook SessionStart lifecycle source: 'startup' (default) or 'resume' on HITL-rebuild paths. */
+  sessionStartSource?: string;
   /** Request-scoped tool input failures consumed by the completion handler. */
   toolInputValidationErrors?: Map<string, ToolInputValidationError>;
 } & Pick<
@@ -1492,6 +1554,8 @@ export async function createRun({
       initialSummary: isSubagent ? undefined : initialSummary,
       contextPruningConfig: summarization.contextPruning,
       maxToolResultChars: agent.maxToolResultChars,
+      initialSessions: buildAgentInitialToolSessions(agent, initialSessions),
+      codeSessionKey: agent.codeSessionKey,
     };
     if (askGraphTools) {
       /**
@@ -1512,6 +1576,27 @@ export async function createRun({
     configCount: 0,
     rootAgentIds: agents.map((agent) => agent.id),
   };
+  const prebuiltGraphInputs = new Map<string, AgentInputs>();
+  const visitedConfigIds = new Set<string>();
+  const pendingConfigs: Array<RunAgent | null | undefined> = [...agents];
+  for (let index = 0; index < pendingConfigs.length; index++) {
+    const config = pendingConfigs[index];
+    if (!config?.id || visitedConfigIds.has(config.id)) {
+      continue;
+    }
+    visitedConfigIds.add(config.id);
+    if (!prebuiltGraphInputs.has(config.id)) {
+      prebuiltGraphInputs.set(config.id, buildIsolatedAgentInputs(config, buildAgentInput));
+    }
+    for (const graph of config.subagentGraphConfigs ?? []) {
+      for (const member of graph.memberConfigs) {
+        if (!prebuiltGraphInputs.has(member.id)) {
+          prebuiltGraphInputs.set(member.id, buildIsolatedAgentInputs(member, buildAgentInput));
+        }
+      }
+    }
+    enqueueSubagentChildren(config, pendingConfigs, visitedConfigIds, false, false);
+  }
   for (const agent of agents) {
     const agentInput = buildAgentInput(agent);
     const subagentConfigs = buildSubagentConfigs(
@@ -1520,6 +1605,9 @@ export async function createRun({
       buildAgentInput,
       subagentBuildState,
       agentsEndpointConfig,
+      undefined,
+      0,
+      prebuiltGraphInputs,
     );
     if (subagentConfigs.length > 0) {
       agentInput.subagentConfigs = subagentConfigs;
@@ -1568,9 +1656,6 @@ export async function createRun({
    * and the resume route). When disabled, nothing attaches and the run is identical
    * to before this feature shipped.
    */
-  // Per-agent truth resolved by initializeAgent (admin capability AND builder
-  // opt-in AND code env) — the run opts in when any reachable agent did.
-  const statefulCodeSessions = anyAgentHasStatefulSessions(agents);
   // Resolve the effective policy through the single seam so per-agent / per-skill
   // sources can layer in later without touching this call site (see
   // `resolveToolApprovalPolicy`). Only the endpoint layer is wired today, so this
@@ -1644,6 +1729,34 @@ export async function createRun({
     if (steering.preemptHook != null && isSteerPreemptSupported()) {
       hooks.register('PreemptBoundary', { hooks: [steering.preemptHook] });
     }
+  }
+  /**
+   * Deployment-plugin hooks (Agent Plugins `ai.librechat/hooks/hooks.json`)
+   * register last so internal policy hooks (HITL, labels, steering) keep
+   * their ordering. The source is wired at startup by the plugins package
+   * (see `setPluginHookSource` in api/server/index.js) and stays empty
+   * unless the operator installed plugins with hook documents AND opted in
+   * via DEPLOYMENT_PLUGIN_HOOKS. The conversation id doubles as the plugin
+   * "session", giving SessionStart its once-per-conversation scope.
+   */
+  const pluginHookSource = getPluginHookSource();
+  if (pluginHookSource?.hasHooks() === true) {
+    hooks = hooks ?? new HookRegistry();
+    const primaryAgent = agents[0];
+    pluginHookSource.register({
+      registry: hooks,
+      context: {
+        sessionId: requestBody?.conversationId,
+        userId: user?.id,
+        sessionStartSource,
+        model: primaryAgent?.model_parameters?.model ?? primaryAgent?.model ?? undefined,
+        agentType: primaryAgent?.id,
+      },
+      // `ask` needs the checkpointer + resume surface; without HITL wiring the
+      // source tightens plugin `ask` decisions to `deny` rather than stranding
+      // the run on an un-resumable interrupt.
+      askDecisionSupported: hitl != null,
+    });
   }
 
   const streamLimits = resolveStreamLimits(agentsEndpointConfig);
@@ -1728,15 +1841,6 @@ export async function createRun({
     }),
     ...(enableToolOutputReferences && {
       toolOutputReferences: { enabled: true },
-    }),
-    // Best-effort stateful runtime sessions on the remote Code API. The SDK
-    // stamps a per-conversation session hint on execute_code/bash requests and
-    // hedges those tools' descriptions; the transport is otherwise unchanged.
-    // `engine` is omitted (defaults to `sandbox`) and the hint defaults to
-    // thread_id. Requires @librechat/agents with `toolExecution.sandbox`;
-    // older versions ignore the field.
-    ...(statefulCodeSessions && {
-      toolExecution: { sandbox: { statefulSessions: true } },
     }),
     // HITL opt-in: the `humanInTheLoop` switch + the PreToolUse policy hook. Spread
     // here (not just `compileOptions.checkpointer` above) so an `ask` decision raises

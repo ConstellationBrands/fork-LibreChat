@@ -10,8 +10,11 @@ const {
   isHITLEnabled,
   captureAgentCheckpointGeneration,
   deleteAgentCheckpoint,
+  attachAskUserQuestionAnswers,
   attachAskUserQuestionArgs,
   createMessageFilterPii,
+  isAgentTriggerRequest,
+  exemptAgentTriggerFromIpLimiter,
 } = require('@librechat/api');
 const { createSseStreamTelemetry } = require('@librechat/api/telemetry');
 const { logger } = require('@librechat/data-schemas');
@@ -39,6 +42,10 @@ const { v1 } = require('./v1');
 const chat = require('./chat');
 
 const { LIMIT_MESSAGE_IP, LIMIT_MESSAGE_USER } = process.env ?? {};
+
+/** Applies `limiter` unless this trusted loopback request should skip it. */
+const unless = (isExempt, limiter) => (req, res, next) =>
+  isExempt(req) ? next() : limiter(req, res, next);
 
 /** Untenanted jobs (pre-multi-tenancy) remain accessible if the userId check passes. */
 function hasTenantMismatch(job, user) {
@@ -108,6 +115,12 @@ router.use('/v1/responses', responses);
 router.use('/v1', openai);
 
 router.use(requireJwtAuth);
+// Capture the short-lived trigger identity immediately after authentication. Downstream
+// middleware reads this stable decision instead of re-verifying an expired token.
+router.use((req, _res, next) => {
+  req._isAgentTrigger = isAgentTriggerRequest(req);
+  next();
+});
 router.use(checkBan);
 router.use(uaParser);
 
@@ -636,10 +649,12 @@ router.post('/chat/abort', configMiddleware, async (req, res, next) => {
       // chunk log, which never saw the pause-time stamp applied to the in-process
       // contentParts — stamping inside abortJob (not after) means the LIVE client
       // gets the question too, not just the saved message on reload.
-      const abortedAskPayload = job.metadata?.pendingAction?.payload;
+      const initialResolvedAskUserQuestions = job.metadata?.resolvedAskUserQuestions;
       const agentsCfg = req.config?.endpoints?.agents;
       const shouldPruneCheckpoint =
-        isHITLEnabled(agentsCfg?.toolApproval) || job.metadata?.pendingAction != null;
+        isHITLEnabled(agentsCfg?.toolApproval) ||
+        job.metadata?.pendingAction != null ||
+        initialResolvedAskUserQuestions?.length > 0;
       const checkpointNamespace =
         typeof job.metadata?.checkpointNamespace === 'string'
           ? job.metadata.checkpointNamespace
@@ -656,10 +671,23 @@ router.post('/chat/abort', configMiddleware, async (req, res, next) => {
           : undefined;
       const abortResult = await GenerationJobManager.abortJob(jobStreamId, {
         expectedCreatedAt: job.createdAt,
-        transformAbortContent: (content) =>
-          abortedAskPayload?.type === 'ask_user_question' && Array.isArray(content)
-            ? attachAskUserQuestionArgs(content, abortedAskPayload.question)
-            : content,
+        transformAbortContent: (content, abortJobData) => {
+          if (!Array.isArray(content)) {
+            return content;
+          }
+          const abortedAskPayload = abortJobData.pendingAction?.payload;
+          const resolvedAskUserQuestions = abortJobData.resolvedAskUserQuestions ?? [];
+          const answeredContent = attachAskUserQuestionAnswers(content, resolvedAskUserQuestions);
+          return abortedAskPayload?.type === 'ask_user_question'
+            ? attachAskUserQuestionArgs(
+                answeredContent,
+                Array.isArray(abortedAskPayload.questions)
+                  ? { questions: abortedAskPayload.questions }
+                  : abortedAskPayload.question,
+                abortedAskPayload.tool_call_id,
+              )
+            : answeredContent;
+        },
         /** Persist every parent-row prerequisite before publishing the ordinary
          * abort FINAL. That frame can immediately drain a queued follow-up, whose
          * parent must already exist and whose graph must not see a stale HITL
@@ -883,7 +911,7 @@ router.post('/chat/abort', configMiddleware, async (req, res, next) => {
  */
 const steerLimiters = [];
 if (isEnabled(LIMIT_MESSAGE_IP)) {
-  steerLimiters.push(messageIpLimiter);
+  steerLimiters.push(unless(exemptAgentTriggerFromIpLimiter, messageIpLimiter));
 }
 if (isEnabled(LIMIT_MESSAGE_USER)) {
   steerLimiters.push(messageUserLimiter);
@@ -895,6 +923,22 @@ router.post(
   createMessageFilterPii({ getConfig: (req) => req.config?.messageFilter?.pii }),
   moderateText,
   SteerController,
+);
+
+/**
+ * @route POST /chat/steer/deliver
+ * @desc Strict, idempotent steer admission for trusted event-delivery hosts
+ * @access Private
+ * @description Uses the same text-admission chain as an interactive steer,
+ * then requires a v2 durable receipt and exact originating-agent identity.
+ */
+router.post(
+  '/chat/steer/deliver',
+  configMiddleware,
+  ...steerLimiters,
+  createMessageFilterPii({ getConfig: (req) => req.config?.messageFilter?.pii }),
+  moderateText,
+  SteerController.SteerDeliveryController,
 );
 
 /**
@@ -929,7 +973,7 @@ const chatRouter = express.Router();
 chatRouter.use(configMiddleware);
 
 if (isEnabled(LIMIT_MESSAGE_IP)) {
-  chatRouter.use(messageIpLimiter);
+  chatRouter.use(unless(exemptAgentTriggerFromIpLimiter, messageIpLimiter));
 }
 
 if (isEnabled(LIMIT_MESSAGE_USER)) {

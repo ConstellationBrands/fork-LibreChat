@@ -58,13 +58,18 @@ const {
   stampSteerPartMedia,
   createActivityLabelWiring,
   createActivityPhaseWiring,
+  createReasoningLabelHostWiring,
+  generateReasoningLabelRevision,
+  getLabelUsageSequenceSeed,
   createAssistantPhaseStampingHandlers,
   resolveActivityConfig,
   resolveActivityPhaseConfig,
+  resolveReasoningLabelConfig,
   getCustomEndpointConfig,
   mapCollectedMetadataToUsage,
   resolveActivityLabelModel,
   resolveActivityPhaseLabelModel,
+  resolveReasoningLabelModel,
   traceIdForMessage,
   settlePendingLabelFills,
   stripActivityLabelParts,
@@ -78,6 +83,7 @@ const {
   countFormattedMessageTokens,
   prependFileContext,
   prependQuotes,
+  applyAttachmentOnlyText,
   hydrateMissingIndexTokenCounts,
   injectSkillPrimes,
   collectFreshSkillPrimeNames,
@@ -85,6 +91,7 @@ const {
   collectFileIds,
   processTextWithTokenLimit,
   buildAgentScopedContext,
+  buildAgentContextAttachmentsByAgentId,
   buildSkillPrimeContentParts,
   buildInitialToolSessions,
   hasUrlContextTool,
@@ -447,6 +454,35 @@ class AgentClient extends BaseClient {
         throw error;
       });
     return this.activityPhaseLabelLLMPromise;
+  }
+
+  /** Reasoning-label resolution is independently configurable and memoized per response. */
+  async resolveReasoningLabelLLM() {
+    this.reasoningLabelLLMPromise =
+      this.reasoningLabelLLMPromise ??
+      resolveReasoningLabelModel({
+        req: this.options.req,
+        agent: this.options.agent,
+        publicEndpoint: this.options.endpoint,
+        ids: {
+          messageId: this.responseMessageId,
+          conversationId: this.conversationId,
+          parentMessageId: this.parentMessageId,
+        },
+        db: { getUserKey: db.getUserKey, getUserKeyValues: db.getUserKeyValues },
+      }).catch((error) => {
+        this.reasoningLabelLLMPromise = null;
+        throw error;
+      });
+    return this.reasoningLabelLLMPromise;
+  }
+
+  /** Seeds the shared negative usage sequence from durable label-call state. */
+  seedActivityLabelUsageSequence() {
+    this.activityLabelUsageSeq = getLabelUsageSequenceSeed(
+      this.contentParts ?? [],
+      this.activityLabelUsageSeq,
+    );
   }
 
   /**
@@ -856,6 +892,61 @@ class AgentClient extends BaseClient {
     };
   }
 
+  /** SDK bridge for one revision of a live reasoning-step title. */
+  async generateReasoningLabelViaRun({
+    visibleReasoning,
+    reasoningStepId,
+    revision,
+    status,
+    previousLabel,
+    agentId,
+    charLimit,
+    prompt,
+    signal,
+  }) {
+    return generateReasoningLabelRevision({
+      payload: {
+        visibleReasoning,
+        reasoningStepId,
+        revision,
+        status,
+        ...(previousLabel != null && { previousLabel }),
+        ...(agentId != null && { agentId }),
+        charLimit,
+        ...(prompt != null && { prompt }),
+        signal,
+      },
+      run: this.run,
+      resolveModel: () => this.resolveReasoningLabelLLM(),
+      sourceRunId: this.responseMessageId,
+      sourceTraceId: traceIdForMessage(this.responseMessageId),
+      responseId: this.responseMessageId,
+      sessionId: this.conversationId,
+      userId: this.user ?? this.options.req?.user?.id,
+      parentMessageId: this.parentMessageId,
+      recordUsage: ({
+        collectedMetadata,
+        model,
+        endpointTokenConfig,
+        sameEndpoint,
+        provider,
+        promptText,
+        completionText,
+      }) =>
+        this.recordActivityLabelUsage(
+          collectedMetadata,
+          model,
+          endpointTokenConfig,
+          sameEndpoint,
+          undefined,
+          provider,
+          () => ({ promptText, completionText }),
+          'reasoning-label',
+        ),
+      onError: (error) => logger.warn('[AgentClient] Reasoning label generation failed', error),
+    });
+  }
+
   /** Bounded settle for in-flight label fills before finalization. On
    *  timeout the label scope is closed and its abort controller fired, so a
    *  straggler cannot mutate the saved response or emit into a dead job. */
@@ -870,20 +961,34 @@ class AgentClient extends BaseClient {
         scope.detach?.();
       }
     };
-    const pending = this.pendingActivityLabelFills;
-    if (!pending || pending.length === 0) {
-      detachScopeListeners();
-      return;
-    }
-    this.pendingActivityLabelFills = [];
-    await settlePendingLabelFills(pending, timeoutMs, () => {
+    const closeScopes = () => {
       /** Close EVERY generation's scope: a pre-pause wiring's straggler must
        *  stay closed even though a resume built a newer one. */
       for (const scope of this.activityLabelScopes ?? []) {
         scope.closed = true;
         scope.abort.abort();
       }
-    });
+    };
+    const deadline = Date.now() + timeoutMs;
+    while ((this.pendingActivityLabelFills?.length ?? 0) > 0) {
+      const pending = this.pendingActivityLabelFills;
+      this.pendingActivityLabelFills = [];
+      const remainingMs = Math.max(0, deadline - Date.now());
+      let timedOut = remainingMs === 0;
+      if (!timedOut) {
+        await settlePendingLabelFills(pending, remainingMs, () => {
+          timedOut = true;
+          closeScopes();
+        });
+      }
+      if (timedOut) {
+        closeScopes();
+        break;
+      }
+      /** A reasoning revision can synchronously enqueue its trailing final
+       *  revision from the settled task's `finally`; drain it under the same
+       *  deadline before any content reshaping can invalidate its index. */
+    }
     detachScopeListeners();
   }
 
@@ -974,9 +1079,7 @@ class AgentClient extends BaseClient {
      *  the client's `runId:seq` deduper would discard the post-approval
      *  label's usage as already counted. Each label generation is a single
      *  non-streaming invoke, so one existing label part == one consumed seq. */
-    this.activityLabelUsageSeq =
-      this.activityLabelUsageSeq ??
-      (this.contentParts ?? []).filter((part) => part?.type === ContentTypes.ACTIVITY_LABEL).length;
+    this.seedActivityLabelUsageSequence();
     this.activityLabelAbort = labelScope.abort;
     /** An abort CLOSES the scope, not just cancels the call. The rejected
      *  generation still runs its catch and calls `fill(null)`; with the scope
@@ -1123,9 +1226,7 @@ class AgentClient extends BaseClient {
         scope.detach = () => abortSignal.removeEventListener('abort', closeOnAbort);
       }
     }
-    this.activityLabelUsageSeq =
-      this.activityLabelUsageSeq ??
-      (this.contentParts ?? []).filter((part) => part?.type === ContentTypes.ACTIVITY_LABEL).length;
+    this.seedActivityLabelUsageSequence();
 
     const wiring = createActivityPhaseWiring({
       maxPerRun: phaseConfig.maxPerRun,
@@ -1160,6 +1261,72 @@ class AgentClient extends BaseClient {
       generatePhase: (payload) => this.generateActivityPhaseViaRun(payload),
     });
     this.activityPhaseWiring = wiring;
+    return wiring;
+  }
+
+  /** Builds the independently opt-in live reasoning-label controller. */
+  buildReasoningLabelWiring(streamId, abortSignal, seedFromContent = false) {
+    if (!streamId || typeof Run?.prototype?.generateReasoningLabel !== 'function') {
+      return undefined;
+    }
+    const agentEndpoint = this.options.agent?.endpoint ?? '';
+    const appConfig = this.options.req?.config;
+    let customEndpointConfig;
+    try {
+      customEndpointConfig = getCustomEndpointConfig({ endpoint: agentEndpoint, appConfig });
+    } catch {
+      customEndpointConfig = undefined;
+    }
+    const config = resolveReasoningLabelConfig(
+      appConfig,
+      agentEndpoint,
+      customEndpointConfig,
+      this.options.endpoint,
+    );
+    if (!config.enabled) {
+      return undefined;
+    }
+
+    const shouldMarkResumable = this.activityLabelsMarkedPromise == null;
+    const { wiring, scope, markedPromise } = createReasoningLabelHostWiring({
+      config,
+      seedFromContent,
+      abortSignal,
+      ...(shouldMarkResumable && {
+        markResumable: () => GenerationJobManager.markActivityLabels(streamId, this.jobCreatedAt),
+        onMarkFailure: () =>
+          logger.warn(
+            `[AgentClient] Could not flag reasoning labels for ${streamId}; an update resolving during a resume gap may not be reconciled.`,
+          ),
+      }),
+      getContentParts: () => this.contentParts,
+      getStepIndex: (stepId) => this.stepMap?.get(stepId)?.index,
+      emitEvent: (event, data) =>
+        GenerationJobManager.emitChunk(
+          streamId,
+          {
+            event,
+            data: {
+              ...data,
+              responseMessageId: this.responseMessageId,
+              conversationId: this.conversationId,
+            },
+          },
+          { durable: true, expectedCreatedAt: this.jobCreatedAt },
+        ),
+      trackPendingFill: (fillDone) => {
+        this.pendingActivityLabelFills = this.pendingActivityLabelFills ?? [];
+        this.pendingActivityLabelFills.push(fillDone);
+      },
+      generateLabel: (payload) => this.generateReasoningLabelViaRun(payload),
+    });
+    if (markedPromise != null) {
+      this.activityLabelsMarkedPromise = markedPromise;
+    }
+    this.activityLabelScopes = this.activityLabelScopes ?? [];
+    this.activityLabelScopes.push(scope);
+    this.seedActivityLabelUsageSequence();
+    this.reasoningLabelWiring = wiring;
     return wiring;
   }
 
@@ -1249,16 +1416,23 @@ class AgentClient extends BaseClient {
       return agent;
     };
 
-    /** Collect all agents for unified processing while preserving stable/dynamic instruction fields. */
-    const allAgents = [
-      { agent: normalizeInstructions(this.options.agent), agentId: this.options.agent.id },
-      ...(this.agentConfigs?.size > 0
-        ? Array.from(this.agentConfigs.entries()).map(([agentId, agent]) => ({
-            agent: normalizeInstructions(agent),
-            agentId,
-          }))
-        : []),
-    ];
+    /** Collect all runtime agents without promoting isolated subagents into the top-level graph. */
+    const agentsById = new Map();
+    const pendingAgents = [this.options.agent, ...(this.agentConfigs?.values() ?? [])];
+    for (let i = 0; i < pendingAgents.length; i++) {
+      const agent = pendingAgents[i];
+      if (!agent?.id || agentsById.has(agent.id)) {
+        continue;
+      }
+      agentsById.set(agent.id, normalizeInstructions(agent));
+      for (const subagent of agent.subagentAgentConfigs?.values() ?? []) {
+        pendingAgents.push(subagent);
+      }
+      for (const graph of agent.subagentGraphConfigs ?? []) {
+        pendingAgents.push(...graph.memberConfigs);
+      }
+    }
+    const allAgents = [...agentsById].map(([agentId, agent]) => ({ agent, agentId }));
 
     /**
      * Memory authorization/loading and MCP config resolution do not depend on
@@ -1368,6 +1542,19 @@ class AgentClient extends BaseClient {
         prependQuotes(memoryFormattedMessage, message.quotes);
       }
 
+      /**
+       * An attachment-only turn whose files reach the model out-of-band (file
+       * search, code environment) leaves nothing in the content itself, and
+       * providers such as Anthropic reject an empty user message outright.
+       * Applied after the context and quote merges so a turn that already
+       * gained inline content keeps it. The current turn is not carrying
+       * `files` yet (BaseClient assigns them after this returns), so the
+       * resolved attachments come from `message_file_map`.
+       */
+      const turnFiles = this.message_file_map?.[message.messageId] ?? message.files;
+      applyAttachmentOnlyText(formattedMessage, turnFiles);
+      applyAttachmentOnlyText(memoryFormattedMessage, turnFiles);
+
       memoryPayload.push(memoryFormattedMessage);
 
       const dbTokenCount = Number(orderedMessages[i].tokenCount);
@@ -1401,7 +1588,7 @@ class AgentClient extends BaseClient {
             this.contextHandlers?.processFile(file);
             continue;
           }
-          if (file.metadata?.codeEnvRef) {
+          if (file.metadata?.codeEnvRef || file.metadata?.codeEnvRefs) {
             continue;
           }
         }
@@ -1602,35 +1789,119 @@ class AgentClient extends BaseClient {
     const ephemeralAgent = this.options.req.body.ephemeralAgent;
     const mcpManager = getMCPManager();
 
-    await Promise.all(
-      allAgents.map(async ({ agent, agentId }) => {
-        const agentRunContextParts = [sharedRunContext];
-        const agentHasMemory = agentHasInlineMemoryTools(agent);
-        if (agentId === this.options.agent.id || memoryAgentEnabled || agentHasMemory) {
-          const partitionMemories = await getAgentPartitionMemories(agent);
-          const agentMemoryContext = buildMemoryContext(
-            agentHasMemory ? partitionMemories?.withKeys : partitionMemories?.withoutKeys,
-          );
-          if (agentMemoryContext) {
-            agentRunContextParts.push(agentMemoryContext);
-          }
+    const prepareRuntimeAgent = async ({ agent, agentId }, scopedContext) => {
+      const agentRunContextParts = [sharedRunContext];
+      const agentHasMemory = agentHasInlineMemoryTools(agent);
+      if (agentId === this.options.agent.id || memoryAgentEnabled || agentHasMemory) {
+        const partitionMemories = await getAgentPartitionMemories(agent);
+        const agentMemoryContext = buildMemoryContext(
+          agentHasMemory ? partitionMemories?.withKeys : partitionMemories?.withoutKeys,
+        );
+        if (agentMemoryContext) {
+          agentRunContextParts.push(agentMemoryContext);
         }
-        const scopedContext = agentScopedContext.get(agentId);
-        if (scopedContext) {
-          agentRunContextParts.push(scopedContext);
-        }
+      }
+      if (scopedContext) {
+        agentRunContextParts.push(scopedContext);
+      }
 
-        return applyContextToAgent({
-          agent,
-          agentId,
-          logger,
-          mcpManager,
-          configServers,
-          sharedRunContext: agentRunContextParts.filter(Boolean).join('\n\n'),
-          ephemeralAgent: agentId === this.options.agent.id ? ephemeralAgent : undefined,
-        });
-      }),
+      return applyContextToAgent({
+        agent,
+        agentId,
+        logger,
+        mcpManager,
+        configServers,
+        sharedRunContext: agentRunContextParts.filter(Boolean).join('\n\n'),
+        ephemeralAgent: agentId === this.options.agent.id ? ephemeralAgent : undefined,
+      });
+    };
+
+    const runtimeAgentPreparations = new WeakMap();
+    const prepareRuntimeAgentOnce = (agent, scopedContext) => {
+      const existing = runtimeAgentPreparations.get(agent);
+      if (existing) {
+        return existing;
+      }
+      const pending = prepareRuntimeAgent({ agent, agentId: agent.id }, scopedContext);
+      runtimeAgentPreparations.set(agent, pending);
+      return pending;
+    };
+    await Promise.all(
+      allAgents.map(({ agent, agentId }) =>
+        prepareRuntimeAgentOnce(agent, agentScopedContext.get(agentId)),
+      ),
     );
+
+    const wrappedLazyDescriptors = new WeakSet();
+    const wrapLazyResolvers = (configs) => {
+      const pending = [...configs];
+      const visitedConfigs = new WeakSet();
+      for (let index = 0; index < pending.length; index++) {
+        const config = pending[index];
+        if (!config || visitedConfigs.has(config)) {
+          continue;
+        }
+        visitedConfigs.add(config);
+        pending.push(...(config.subagentAgentConfigs ?? []));
+        for (const graph of config.subagentGraphConfigs ?? []) {
+          pending.push(...graph.memberConfigs);
+        }
+        for (const descriptor of config.lazySubagentConfigs ?? []) {
+          pending.push(descriptor);
+          if (wrappedLazyDescriptors.has(descriptor)) {
+            continue;
+          }
+          wrappedLazyDescriptors.add(descriptor);
+          const resolve = descriptor.resolve;
+          descriptor.resolve = async (context) => {
+            const resolved = await resolve(context);
+            const resolvedAgents = [];
+            const resolvedPending = [resolved];
+            const resolvedIds = new Set();
+            for (let resolvedIndex = 0; resolvedIndex < resolvedPending.length; resolvedIndex++) {
+              const resolvedAgent = resolvedPending[resolvedIndex];
+              if (!resolvedAgent?.id || resolvedIds.has(resolvedAgent.id)) {
+                continue;
+              }
+              resolvedIds.add(resolvedAgent.id);
+              resolvedAgents.push(resolvedAgent);
+              resolvedPending.push(...(resolvedAgent.subagentAgentConfigs ?? []));
+              for (const graph of resolvedAgent.subagentGraphConfigs ?? []) {
+                resolvedPending.push(...graph.memberConfigs);
+              }
+            }
+            const unpreparedAgents = resolvedAgents.filter(
+              (agent) => !runtimeAgentPreparations.has(agent),
+            );
+            if (unpreparedAgents.length > 0) {
+              const pending = buildAgentScopedContext({
+                agentIds: unpreparedAgents.map((agent) => agent.id),
+                attachmentsByAgentId: buildAgentContextAttachmentsByAgentId(unpreparedAgents),
+                sharedRunAttachmentIds,
+                req: this.options.req,
+                tokenCountFn: (text) => countTokens(text),
+              }).then((lateScopedContext) =>
+                Promise.all(
+                  unpreparedAgents.map((agent) =>
+                    prepareRuntimeAgent(
+                      { agent, agentId: agent.id },
+                      lateScopedContext.get(agent.id),
+                    ),
+                  ),
+                ),
+              );
+              for (const agent of unpreparedAgents) {
+                runtimeAgentPreparations.set(agent, pending);
+              }
+            }
+            await Promise.all(resolvedAgents.map((agent) => runtimeAgentPreparations.get(agent)));
+            wrapLazyResolvers(resolvedAgents);
+            return resolved;
+          };
+        }
+      }
+    };
+    wrapLazyResolvers([this.options.agent, ...(this.agentConfigs?.values() ?? [])]);
 
     return result;
   }
@@ -2248,17 +2519,25 @@ class AgentClient extends BaseClient {
    */
   /**
    * @deprecated Agent Chain — strip hidden intermediate sequential-agent content
-   * before persistence, keeping only the last part + tool_call parts. Mirrors the
-   * chat path so a HITL resume doesn't persist/emit intermediate outputs the
-   * agent's `hide_sequential_outputs` setting is meant to hide.
+   * before persistence, keeping only the last non-label part + tool_call parts.
+   * Parent activity markers can be appended after the final answer, so physical
+   * array order alone cannot identify the response output that must survive.
    */
   applyHideSequentialOutputsFilter() {
     if (!this.options.agent?.hide_sequential_outputs || !Array.isArray(this.contentParts)) {
       return;
     }
+    let lastOutputIndex = -1;
+    for (let index = this.contentParts.length - 1; index >= 0; index -= 1) {
+      const part = this.contentParts[index];
+      if (part != null && part.type !== ContentTypes.ACTIVITY_LABEL) {
+        lastOutputIndex = index;
+        break;
+      }
+    }
     this.contentParts = this.contentParts.filter(
       (part, index) =>
-        index >= this.contentParts.length - 1 ||
+        index === lastOutputIndex ||
         part.type === ContentTypes.TOOL_CALL ||
         // Steer parts are user speech, not intermediate agent output — dropping
         // one would erase the user's words from the persisted turn.
@@ -2287,14 +2566,44 @@ class AgentClient extends BaseClient {
     if (!Array.isArray(previousParts) || !Array.isArray(this.contentParts)) {
       return;
     }
+    /** Preserve sparse coordinates when completion did not actually reshape
+     *  the content. A phase can reserve a leading hole for a tool part whose
+     *  SDK event lands after the phase closes; scanning retained identities
+     *  in an unchanged array would skip that hole and move the bound past the
+     *  delayed tool before it arrives. */
+    const previousDefinedIndexes = Object.keys(previousParts)
+      .map(Number)
+      .filter((index) => previousParts[index] != null);
+    const currentDefinedIndexes = Object.keys(this.contentParts)
+      .map(Number)
+      .filter((index) => this.contentParts[index] != null);
+    if (previousParts.length === this.contentParts.length) {
+      const unchanged =
+        previousDefinedIndexes.length === currentDefinedIndexes.length &&
+        previousDefinedIndexes.every(
+          (index, position) =>
+            index === currentDefinedIndexes[position] &&
+            previousParts[index] === this.contentParts[index],
+        );
+      if (unchanged) {
+        return;
+      }
+    }
     const retainedIndexes = new Map();
-    for (let index = 0; index < this.contentParts.length; index += 1) {
+    for (const index of currentDefinedIndexes) {
       const part = this.contentParts[index];
       if (part != null) {
         retainedIndexes.set(part, index);
       }
     }
-    for (let markerIndex = 0; markerIndex < this.contentParts.length; markerIndex += 1) {
+    const previousIndexesByPart = new Map();
+    for (const index of previousDefinedIndexes) {
+      const part = previousParts[index];
+      if (part != null) {
+        previousIndexesByPart.set(part, index);
+      }
+    }
+    for (const markerIndex of currentDefinedIndexes) {
       const marker = this.contentParts[markerIndex];
       if (
         marker?.type !== ContentTypes.ACTIVITY_LABEL ||
@@ -2303,24 +2612,63 @@ class AgentClient extends BaseClient {
       ) {
         continue;
       }
-      const previousMarkerIndex = previousParts.indexOf(marker);
-      if (previousMarkerIndex < 0) {
+      const previousMarkerIndex = previousIndexesByPart.get(marker);
+      if (previousMarkerIndex == null) {
         continue;
       }
       const previousStartIndex = Math.min(
         previousMarkerIndex,
         Math.max(0, marker.activity_start_index),
       );
+      const hasExplicitEnd = typeof marker.activity_end_index === 'number';
+      const previousEndIndex = hasExplicitEnd
+        ? Math.max(previousStartIndex, Math.min(previousMarkerIndex, marker.activity_end_index))
+        : previousMarkerIndex;
       let nextStartIndex = markerIndex;
-      for (let index = previousStartIndex; index < previousMarkerIndex; index += 1) {
+      let nextEndIndex = markerIndex;
+      let foundRetainedPart = false;
+      for (const index of previousDefinedIndexes) {
+        if (index < previousStartIndex || index >= previousEndIndex) {
+          continue;
+        }
         const retainedIndex = retainedIndexes.get(previousParts[index]);
         if (retainedIndex != null && retainedIndex < markerIndex) {
-          nextStartIndex = retainedIndex;
-          break;
+          if (!foundRetainedPart) {
+            nextStartIndex = retainedIndex;
+            nextEndIndex = retainedIndex + 1;
+            foundRetainedPart = true;
+          } else {
+            nextStartIndex = Math.min(nextStartIndex, retainedIndex);
+            nextEndIndex = Math.min(markerIndex, Math.max(nextEndIndex, retainedIndex + 1));
+          }
+        }
+      }
+      if (!foundRetainedPart && hasExplicitEnd) {
+        for (const index of previousDefinedIndexes) {
+          if (index < previousEndIndex || index >= previousMarkerIndex) {
+            continue;
+          }
+          const retainedIndex = retainedIndexes.get(previousParts[index]);
+          if (retainedIndex != null && retainedIndex < markerIndex) {
+            nextStartIndex = retainedIndex;
+            nextEndIndex = retainedIndex;
+            break;
+          }
         }
       }
       marker.activity_start_index = nextStartIndex;
+      if (hasExplicitEnd) {
+        marker.activity_end_index = Math.max(nextStartIndex, nextEndIndex);
+      }
     }
+  }
+
+  /** Finalize only a completed root run; HITL interruptions retain their snapshot for resume. */
+  completeActivityPhase(run, activityPhase) {
+    if (typeof run?.getInterrupt === 'function' && run.getInterrupt()?.payload) {
+      return;
+    }
+    activityPhase?.complete?.();
   }
 
   /**
@@ -2371,7 +2719,9 @@ class AgentClient extends BaseClient {
     if (interrupt.payload?.type === 'ask_user_question' && Array.isArray(this.contentParts)) {
       const stamped = attachAskUserQuestionArgs(
         this.contentParts,
-        interrupt.payload.question,
+        Array.isArray(interrupt.payload.questions)
+          ? { questions: interrupt.payload.questions }
+          : interrupt.payload.question,
         interrupt.payload.tool_call_id,
       );
       if (stamped !== this.contentParts) {
@@ -2492,7 +2842,7 @@ class AgentClient extends BaseClient {
         abortController = new AbortController();
       }
 
-      /** Fire-and-forget: boot the per-conversation stateful sandbox in
+      /** Fire-and-forget: boot each selected stateful environment in
        *  parallel with generation so the first execute_code/bash call lands
        *  on a warm VM. No-op unless a reachable agent resolved
        *  `statefulCodeSessions`. */
@@ -2538,13 +2888,7 @@ class AgentClient extends BaseClient {
         ? await this.options.primeInvokedSkills(payload)
         : undefined;
 
-      /**
-       * Seed `Graph.sessions` with code-env files primed across every
-       * reachable agent (primary, handoff/addedConvo, and nested
-       * subagents) plus skill-priming output. The merge logic and its
-       * run-wide semantics live in `buildInitialToolSessions`; see that
-       * helper's doc for why this is intentionally NOT per-agent.
-       */
+      /** Seed each reachable agent's trusted code-session partition. */
       const initialSessions = buildInitialToolSessions({
         skillSessions: skillPrimeResult?.initialSessions,
         agents: [this.options.agent, ...(this.agentConfigs ? this.agentConfigs.values() : [])],
@@ -2788,10 +3132,14 @@ class AgentClient extends BaseClient {
 
         const activityLabel = this.buildActivityLabelWiring(streamId, abortController.signal);
         const activityPhase = this.buildActivityPhaseWiring(streamId, abortController.signal);
+        const reasoningLabel = this.buildReasoningLabelWiring(streamId, abortController.signal);
         const offsetHandlers = createSteerIndexOffsetHandlers(
           this.options.eventHandlers,
           this.steerOffsetState,
         );
+        const activityHandlers =
+          activityPhase?.handlers(offsetHandlers) ??
+          (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers);
         const createRunPromise = createRun({
           agents,
           messages,
@@ -2815,9 +3163,7 @@ class AgentClient extends BaseClient {
           signal: abortController.signal,
           /** The phase wrapper stays outermost: it claims and offsets the
            *  parent slot before the text step reaches the normal handlers. */
-          customHandlers:
-            activityPhase?.handlers(offsetHandlers) ??
-            (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers),
+          customHandlers: reasoningLabel?.handlers(activityHandlers) ?? activityHandlers,
           requestBody: config.configurable.requestBody,
           user: createSafeUser(this.options.req?.user),
           tenantId: this.options.req?.user?.tenantId,
@@ -2880,11 +3226,16 @@ class AgentClient extends BaseClient {
         if (this.activityLabelsMarkedPromise != null) {
           await this.activityLabelsMarkedPromise;
         }
-        await run.processStream({ messages }, config, {
-          callbacks: {
-            [Callback.TOOL_ERROR]: logToolError,
-          },
-        });
+        try {
+          await run.processStream({ messages }, config, {
+            callbacks: {
+              [Callback.TOOL_ERROR]: logToolError,
+            },
+          });
+        } finally {
+          reasoningLabel?.complete();
+        }
+        this.completeActivityPhase(run, activityPhase);
 
         // HITL: if the run paused for tool approval, mark the job
         // `requires_action` + emit the prompt and leave the turn unfinalized
@@ -3164,6 +3515,7 @@ class AgentClient extends BaseClient {
         abortController.signal,
         activityPhaseSnapshot,
       );
+      const reasoningLabel = this.buildReasoningLabelWiring(streamId, abortController.signal, true);
       const offsetHandlers = createSteerIndexOffsetHandlers(
         createContentIndexOffsetHandlers(
           this.options.eventHandlers,
@@ -3171,6 +3523,9 @@ class AgentClient extends BaseClient {
         ),
         this.steerOffsetState,
       );
+      const activityHandlers =
+        activityPhase?.handlers(offsetHandlers) ??
+        (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers);
       run = await createRun({
         agents,
         // State (messages, tool calls) is rehydrated from the checkpoint by
@@ -3179,6 +3534,9 @@ class AgentClient extends BaseClient {
         // The resumed run can pause AGAIN (another tool, a follow-up question), and this
         // controller owns that lifecycle, so it must keep the HITL wiring on the rebuilt run.
         hitlCapable: true,
+        // Plugin SessionStart hooks match on the lifecycle source; a rebuilt run is a
+        // resume, not a fresh startup.
+        sessionStartSource: 'resume',
         toolInputValidationErrors: this.toolInputValidationErrors,
         // Steering stays live across a pause/resume cycle: steers queued while
         // the resumed segment runs drain at its tool-batch boundaries.
@@ -3200,9 +3558,7 @@ class AgentClient extends BaseClient {
         // type mismatch, is silently dropped against) the pre-pause content. The
         // steer wrapper composes on top: resumed indices shift by seed + any
         // steer parts spliced in while the resumed segment streams.
-        customHandlers:
-          activityPhase?.handlers(offsetHandlers) ??
-          (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers),
+        customHandlers: reasoningLabel?.handlers(activityHandlers) ?? activityHandlers,
         requestBody: config.configurable.requestBody,
         user: createSafeUser(this.options.req?.user),
         tenantId: this.options.req?.user?.tenantId,
@@ -3250,12 +3606,17 @@ class AgentClient extends BaseClient {
       if (this.activityLabelsMarkedPromise != null) {
         await this.activityLabelsMarkedPromise;
       }
-      await run.resume(
-        resumeValue,
-        config,
-        { callbacks: { [Callback.TOOL_ERROR]: logToolError } },
-        commandOptions,
-      );
+      try {
+        await run.resume(
+          resumeValue,
+          config,
+          { callbacks: { [Callback.TOOL_ERROR]: logToolError } },
+          commandOptions,
+        );
+      } finally {
+        reasoningLabel?.complete();
+      }
+      this.completeActivityPhase(run, activityPhase);
 
       config.signal = null;
 
@@ -3614,6 +3975,7 @@ class AgentClient extends BaseClient {
    * @param {string} [params.model]
    * @param {OpenAIUsageMetadata} [params.usage]
    * @param {AppConfig['balance']} [params.balance]
+   * @param {AppConfig['transactions']} [params.transactions]
    * @param {string} [params.context='message']
    * @returns {Promise<void>}
    */
@@ -3621,6 +3983,7 @@ class AgentClient extends BaseClient {
     model,
     usage,
     balance,
+    transactions,
     promptTokens,
     completionTokens,
     context = 'message',
@@ -3631,6 +3994,7 @@ class AgentClient extends BaseClient {
           model,
           context,
           balance,
+          transactions,
           messageId: this.responseMessageId,
           conversationId: this.conversationId,
           user: this.user ?? this.options.req.user?.id,
@@ -3649,6 +4013,7 @@ class AgentClient extends BaseClient {
           {
             model,
             balance,
+            transactions,
             context: 'reasoning',
             messageId: this.responseMessageId,
             conversationId: this.conversationId,

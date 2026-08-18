@@ -1,6 +1,7 @@
 import type { Agents } from 'librechat-data-provider';
 import type { EventEmitter } from 'events';
 import type { ActivityPhaseSnapshot } from '~/agents/activityPhases/runtime';
+import type { ResolvedAskUserQuestion } from '../agents/hitl/resume';
 import type { ServerSentEvent } from './events';
 
 export interface GenerationJobMetadata {
@@ -40,6 +41,10 @@ export interface GenerationJobMetadata {
   activityPhaseSnapshot?: ActivityPhaseSnapshot;
   /** See `SerializableJobData.preemptCapable`. */
   preemptCapable?: boolean;
+  /** Exact provider segment whose completion gates destructive user cleanup. */
+  providerExecutionId?: string;
+  /** False only while that exact provider segment can still mutate user data. */
+  providerDrained?: boolean;
   /** Terminal close has atomically stopped new steer acceptance, even if the
    * final status CAS has not yet run. */
   steersClosed?: boolean;
@@ -51,6 +56,8 @@ export interface GenerationJobMetadata {
   terminalPersistenceStartedAt?: number;
   /** Set when the job is paused for human review (status === 'requires_action') */
   pendingAction?: Agents.PendingAction;
+  /** Accepted ask-user answer retained until this generation terminalizes. */
+  resolvedAskUserQuestions?: ResolvedAskUserQuestion[];
 }
 
 export type GenerationJobStatus = 'running' | 'complete' | 'error' | 'aborted' | 'requires_action';

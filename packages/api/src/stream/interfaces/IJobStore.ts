@@ -1,6 +1,7 @@
 import type { Agents, TFile, TPendingSteer } from 'librechat-data-provider';
 import type { StandardGraph } from '@librechat/agents';
 import type { ActivityPhaseSnapshot } from '~/agents/activityPhases/runtime';
+import type { ResolvedAskUserQuestion } from '~/agents/hitl/resume';
 import type { RecoveredSteerPayload } from '../SteerRecovery';
 
 /**
@@ -106,6 +107,13 @@ export interface SerializableJobData {
    * evidence and must be treated like true by replacement handoff. */
   providerAbortReady?: boolean;
 
+  /** Opaque identity of the currently executing provider segment. A HITL resume
+   * replaces it so an earlier paused segment cannot acknowledge the new run. */
+  providerExecutionId?: string;
+  /** False while the identified provider segment can still mutate user data;
+   * true before provider startup and after the owner has fully unwound. */
+  providerDrained?: boolean;
+
   /** Whether the user-message created event has been emitted */
   createdEventEmitted?: boolean;
 
@@ -163,6 +171,12 @@ export interface SerializableJobData {
    */
   pendingAction?: Agents.PendingAction;
 
+  /** Durable bridge between the resume claim and content reconstruction. An
+   * abort can win while the resume controller is still rebuilding the client;
+   * retaining the accepted answer here lets that terminal owner stamp it onto
+   * the persisted partial response instead of losing it with the request. */
+  resolvedAskUserQuestions?: ResolvedAskUserQuestion[];
+
   /**
    * Flat mirror of `pendingAction.actionId`, kept as a top-level field so an
    * atomic status transition can guard on it (a nested JSON field can't be
@@ -194,7 +208,12 @@ export interface SerializableJobData {
  * reconstruct it without exposing it through normal job serialization. */
 export type ReplacedGeneration = Pick<
   SerializableJobData,
-  'createdAt' | 'status' | 'conversationId' | 'providerAbortReady'
+  | 'createdAt'
+  | 'status'
+  | 'conversationId'
+  | 'providerAbortReady'
+  | 'providerExecutionId'
+  | 'providerDrained'
 >;
 
 /** Latest generation epoch checked by a conditional create. A retained epoch
@@ -262,7 +281,10 @@ export type JobMetadataPatch = Partial<
     | 'discoveredTools'
     | 'activityPhaseSnapshot'
     | 'preemptCapable'
+    | 'providerExecutionId'
+    | 'providerDrained'
     | 'generationProtocolVersion'
+    | 'resolvedAskUserQuestions'
   >
 >;
 
@@ -643,7 +665,6 @@ export interface IJobStore {
   getJobCountByStatus(status: JobStatus): Promise<number>;
   destroy(): Promise<void>;
   getActiveJobIdsByUser(userId: string, tenantId?: string): Promise<string[]>;
-
   setGraph(streamId: string, graph: StandardGraph, expectedCreatedAt?: number): void;
   setContentParts(
     streamId: string,
@@ -741,6 +762,23 @@ export interface IJobStoreV2 extends IJobStore {
     updates: Partial<SerializableJobData>,
     expectedCreatedAt?: number,
   ): Promise<void>;
+
+  /** Atomically marks only the exact provider segment as fully unwound. */
+  markProviderExecutionDrained(
+    streamId: string,
+    expectedCreatedAt: number,
+    providerExecutionId: string,
+  ): Promise<boolean>;
+
+  /** Activates the provider only while its exact generation is still running. */
+  beginProviderExecution(
+    streamId: string,
+    expectedCreatedAt: number,
+    providerExecutionId: string,
+  ): Promise<boolean>;
+
+  /** Includes terminal jobs whose provider still owns user-data writes. */
+  getCleanupBlockingJobIdsByUser(userId: string, tenantId?: string): Promise<string[]>;
 
   /** Atomically replaces an abort persistence-pending marker with the one
    * terminal payload that late subscribers may consume. Exactly one of the
@@ -1264,6 +1302,22 @@ export interface IEventTransport {
   /** Awaitable, generation-correlated abort handoff. Resolves true only after
    * the replica owning that generation processes the abort. */
   emitAbortConfirmed?(streamId: string, generationId: number): Promise<boolean>;
+
+  /** Persist proof that this process synchronously stopped the exact generation.
+   * A delayed replacement can use the proof after the owner's listeners retire. */
+  recordAbortAcknowledgement?(streamId: string, generationId: number): Promise<boolean>;
+
+  /** Persist/read exact proof that a provider segment can no longer mutate user data. */
+  recordProviderDrain?(
+    streamId: string,
+    generationId: number,
+    providerExecutionId: string,
+  ): Promise<boolean>;
+  hasProviderDrain?(
+    streamId: string,
+    generationId: number,
+    providerExecutionId: string,
+  ): Promise<boolean>;
 
   /** Publish a predecessor DONE only while the current job's opaque creation
    * attempt still carries that predecessor in its durable receipt chain. */

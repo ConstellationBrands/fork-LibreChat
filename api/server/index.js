@@ -29,6 +29,10 @@ const {
   initializeDeploymentSkills,
   initializeDeploymentPlugins,
   getDeploymentPluginSkills,
+  getDeploymentPluginHookCapabilities,
+  registerDeploymentPluginHooks,
+  hasDeploymentPluginHooks,
+  setPluginHookSource,
   loadToolApprovalHooks,
   maybeInjectQueryDevtoolsBootstrap,
   preAuthTenantMiddleware,
@@ -52,6 +56,7 @@ const initializeOAuthReconnectManager = require('./services/initializeOAuthRecon
 const { capabilityContextMiddleware } = require('./middleware/roles/capabilities');
 const createValidateImageRequest = require('./middleware/validateImageRequest');
 const { initializeGitHubSkillSync } = require('./services/Skills/sync');
+const { initializeAgentTriggerService } = require('./services/Agents/triggers');
 const { jwtLogin, ldapLogin, passportLogin } = require('~/strategies');
 const { startExpiredFileSweep } = require('./services/Files/process');
 const { checkMigrations } = require('./services/start/migration');
@@ -137,10 +142,15 @@ const startServer = async () => {
   app.disable('x-powered-by');
   app.set('trust proxy', trusted_proxy);
 
-  if (isEnabled(process.env.TENANT_ISOLATION_STRICT)) {
+  if (isEnabled(process.env.TRUST_TENANT_HEADER)) {
     logger.warn(
-      '[Security] TENANT_ISOLATION_STRICT is active. Ensure your reverse proxy strips or sets ' +
-        'the X-Tenant-Id header — untrusted clients must not be able to set it directly.',
+      '[Security] TRUST_TENANT_HEADER is active. Ensure your reverse proxy strips and sets ' +
+        'X-Tenant-Id — untrusted clients must not be able to supply it directly.',
+    );
+  } else if (isEnabled(process.env.TENANT_ISOLATION_STRICT)) {
+    logger.warn(
+      '[Security] TENANT_ISOLATION_STRICT is active while TRUST_TENANT_HEADER is disabled. ' +
+        'Pre-authentication tenant headers will be ignored.',
     );
   }
 
@@ -155,7 +165,18 @@ const startServer = async () => {
   const appConfig = await getAppConfig({ baseOnly: true });
   initializeFileStorage(appConfig);
   const projectRoot = path.resolve(__dirname, '../..');
-  await initializeDeploymentPlugins({ projectRoot });
+  // Plugin hooks execute only when the operator opts in via DEPLOYMENT_PLUGIN_HOOKS;
+  // without it, declared hook documents load as parsed-but-inert with a warning.
+  await initializeDeploymentPlugins({
+    projectRoot,
+    hookCapabilities: getDeploymentPluginHookCapabilities(),
+  });
+  // Hand the run seam its plugin-hook source without a packages/api-internal
+  // agents -> plugins import (see agents/hooks/source.ts).
+  setPluginHookSource({
+    hasHooks: hasDeploymentPluginHooks,
+    register: registerDeploymentPluginHooks,
+  });
   await initializeDeploymentSkills({
     projectRoot,
     additionalSkills: getDeploymentPluginSkills(),
@@ -377,6 +398,7 @@ const startServer = async () => {
       if (inspectFlags || isEnabled(process.env.MEM_DIAG)) {
         memoryDiagnostics.start();
       }
+      await initializeAgentTriggerService({ address: server.address() });
       serverReady = true;
       logger.info('Server readiness checks passing.');
     } catch (initErr) {

@@ -81,6 +81,22 @@ describe('MCPServerInspector', () => {
       });
     });
 
+    it('should keep trusted direct OpenID bearer configuration out of MCP OAuth detection', async () => {
+      const rawConfig = {
+        type: 'streamable-http' as const,
+        url: 'https://api.example.com/mcp',
+        source: 'yaml' as const,
+        headers: { Authorization: 'Bearer {{LIBRECHAT_OPENID_ACCESS_TOKEN}}' },
+      } as t.MCPOptions;
+
+      const result = await MCPServerInspector.inspect('test_server', rawConfig, mockConnection);
+
+      expect(result.requiresOAuth).toBe(false);
+      expect(result.oauthMetadata).toBeNull();
+      expect(mockDetectOAuthRequirement).not.toHaveBeenCalled();
+      expect(MCPConnectionFactory.create).not.toHaveBeenCalled();
+    });
+
     it('should skip capabilities fetch when startup=false', async () => {
       const rawConfig: t.MCPOptions = {
         type: 'stdio',
@@ -595,6 +611,33 @@ describe('MCPServerInspector', () => {
       const key = 'file_read_mcp_My_Server';
       expect(Object.keys(result)).toEqual([key]);
       expect(result[key]['function'].name).toBe(key);
+    });
+
+    it('strips a redundant server-name prefix from keys and records the raw name', async () => {
+      mockConnection.fetchOrderedToolsSnapshot = jest.fn().mockResolvedValue({
+        complete: true,
+        tools: [
+          {
+            name: 'acme_trace_top_time_consuming_operations',
+            description: 'Trace',
+            inputSchema: { type: 'object', properties: {} },
+          },
+          {
+            name: 'list_services',
+            description: 'List',
+            inputSchema: { type: 'object', properties: {} },
+          },
+        ],
+      });
+
+      const { tools: result } = await MCPServerInspector.getToolCatalog('acme', mockConnection);
+
+      const strippedKey = 'trace_top_time_consuming_operations_mcp_acme';
+      const plainKey = 'list_services_mcp_acme';
+      expect(Object.keys(result).sort()).toEqual([plainKey, strippedKey].sort());
+      expect(result[strippedKey]['function'].name).toBe(strippedKey);
+      expect(result[strippedKey].serverToolName).toBe('acme_trace_top_time_consuming_operations');
+      expect(result[plainKey].serverToolName).toBeUndefined();
     });
 
     it('rejects an incomplete snapshot before it can replace cached tools', async () => {

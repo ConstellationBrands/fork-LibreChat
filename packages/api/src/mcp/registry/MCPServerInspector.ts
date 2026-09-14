@@ -1,5 +1,5 @@
 import { logger } from '@librechat/data-schemas';
-import { Constants, normalizeServerName } from 'librechat-data-provider';
+import { Constants, normalizeServerName, stripServerNamePrefixes } from 'librechat-data-provider';
 import type { JsonSchemaType } from '@librechat/data-schemas';
 import type { MCPConnection } from '~/mcp/connection';
 import type * as t from '~/mcp/types';
@@ -11,6 +11,7 @@ import {
 } from '~/mcp/utils';
 import { isMCPDomainAllowed, extractMCPServerDomain } from '~/auth/domain';
 import { normalizeJsonSchema, resolveJsonSchemaRefs } from '~/mcp/zod';
+import { isDirectOpenIDBearerRecoveryEnabled } from '~/mcp/openid';
 import { MCPConnectionFactory } from '~/mcp/MCPConnectionFactory';
 import { MCPDomainNotAllowedError } from '~/mcp/errors';
 import { detectOAuthRequirement } from '~/mcp/oauth';
@@ -123,6 +124,11 @@ export class MCPServerInspector {
   }
 
   private async detectOAuth(): Promise<void> {
+    if (isDirectOpenIDBearerRecoveryEnabled(this.config)) {
+      this.config.requiresOAuth = false;
+      this.config.oauthMetadata = null;
+      return;
+    }
     if (this.config.requiresOAuth != null) return;
     if (hasRuntimeUrlPlaceholders(this.config)) return;
     if (this.config.url == null || this.config.startup === false) {
@@ -177,8 +183,10 @@ export class MCPServerInspector {
   public static async getToolCatalog(
     serverName: string,
     connection: MCPConnection,
+    deadlineMs?: number,
+    signal?: AbortSignal,
   ): Promise<{ tools: t.LCAvailableTools; publicationRevision?: string }> {
-    const snapshot = await connection.fetchOrderedToolsSnapshot();
+    const snapshot = await connection.fetchOrderedToolsSnapshot(deadlineMs, signal);
     if (!snapshot.complete) {
       throw new Error(`Incomplete tools/list snapshot for MCP server ${serverName}`);
     }
@@ -188,10 +196,16 @@ export class MCPServerInspector {
     /** Model-facing key: must match the runtime instance name, which embeds
      *  the normalized server name (see `createToolInstance` in MCP.js). */
     const keyServerName = normalizeServerName(serverName);
+    const keyToolNames = stripServerNamePrefixes(
+      tools.map((tool) => tool.name),
+      keyServerName,
+    );
     tools.forEach((tool) => {
-      const name = `${tool.name}${Constants.mcp_delimiter}${keyServerName}`;
+      const keyToolName = keyToolNames.get(tool.name) ?? tool.name;
+      const name = `${keyToolName}${Constants.mcp_delimiter}${keyServerName}`;
       toolFunctions[name] = {
         type: 'function',
+        ...(keyToolName !== tool.name && { serverToolName: tool.name }),
         ['function']: {
           name,
           description: tool.description,

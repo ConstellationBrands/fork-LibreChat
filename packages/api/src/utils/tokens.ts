@@ -1,5 +1,5 @@
 import z from 'zod';
-import { EModelEndpoint } from 'librechat-data-provider';
+import { EModelEndpoint, supportsContext1m } from 'librechat-data-provider';
 import type { EndpointTokenConfig, TokenConfig } from '~/types';
 
 /**
@@ -64,6 +64,7 @@ const openAIModels = {
   'gpt-5.6': 1050000,
   'gpt-5.6-terra': 1050000,
   'gpt-5.6-luna': 1050000,
+  'gpt-6-astra': 1050000, // >272K input prices at the long-context tier (2x input/cache, 1.5x output)
   'chat-latest': 400000,
   'gpt-5-mini': 400000,
   'gpt-5-nano': 400000,
@@ -143,6 +144,7 @@ const googleModels = {
   'gemini-3.5-flash-lite': 1048576,
   'gemini-3.6-flash': 1048576,
   'gemini-3.7-flash': 1048576,
+  'gemini-3.8-flash': 1048576,
 };
 
 const anthropicModels = {
@@ -183,9 +185,11 @@ const anthropicModels = {
   'claude-opus-5': 1000000,
   'claude-fable-5': 1000000,
   'claude-mythos-5': 1000000,
+  'claude-fable-5-1': 1000000,
+  'claude-mythos-5-1': 1000000,
 };
 
-const ANTHROPIC_SONNET_4_6_PLUS_CONTEXT = 1000000;
+const ANTHROPIC_CONTEXT_1M = 1000000;
 const ANTHROPIC_SONNET_4_6_PLUS_OUTPUT = 128000;
 const ANTHROPIC_SONNET_4_6_PLUS_PATTERN =
   /(?:claude-sonnet[-.]?4[-.]?(?:[6-9]|\d{2})|claude[-.]?4[-.]?(?:[6-9]|\d{2})[-.]?sonnet)(?=$|[^0-9])/;
@@ -200,14 +204,11 @@ function usesAnthropicContextMap(endpoint: EModelEndpoint): boolean {
   );
 }
 
-function getAnthropicSonnet46PlusContext(
-  modelName: string,
-  endpoint: EModelEndpoint,
-): number | undefined {
-  if (!usesAnthropicContextMap(endpoint) || !ANTHROPIC_SONNET_4_6_PLUS_PATTERN.test(modelName)) {
+function getAnthropicContext1m(modelName: string, endpoint: EModelEndpoint): number | undefined {
+  if (!usesAnthropicContextMap(endpoint) || !supportsContext1m(modelName)) {
     return undefined;
   }
-  return ANTHROPIC_SONNET_4_6_PLUS_CONTEXT;
+  return ANTHROPIC_CONTEXT_1M;
 }
 
 function getAnthropicSonnet46PlusOutput(
@@ -508,6 +509,7 @@ export const modelMaxOutputs = {
   'gpt-5.6': 128000,
   'gpt-5.6-terra': 128000,
   'gpt-5.6-luna': 128000,
+  'gpt-6-astra': 128000,
   'chat-latest': 128000,
   'gpt-5-mini': 128000,
   'gpt-5-nano': 128000,
@@ -542,6 +544,8 @@ const anthropicMaxOutputs = {
   'claude-opus-5': 128000,
   'claude-fable-5': 128000,
   'claude-mythos-5': 128000,
+  'claude-fable-5-1': 128000,
+  'claude-mythos-5-1': 128000,
   'claude-3.5-sonnet': 8192,
   'claude-3-5-sonnet': 8192,
   'claude-3.7-sonnet': 128000,
@@ -673,6 +677,10 @@ export function getModelMaxTokens(
   endpoint: EModelEndpoint = EModelEndpoint.openAI,
   endpointTokenConfig?: EndpointTokenConfig,
 ): number | undefined {
+  if (typeof modelName !== 'string') {
+    return undefined;
+  }
+
   /** A partial override only covers the models it lists; fall back to the
    *  built-in map for unlisted models instead of dropping to the default
    *  budget (matches buildTokenConfigMap and getMultiplier). */
@@ -682,9 +690,9 @@ export function getModelMaxTokens(
       return overrideValue;
     }
   }
-  const sonnet46PlusValue = getAnthropicSonnet46PlusContext(modelName, endpoint);
-  if (sonnet46PlusValue != null) {
-    return sonnet46PlusValue;
+  const context1mValue = getAnthropicContext1m(modelName, endpoint);
+  if (context1mValue != null) {
+    return context1mValue;
   }
   return getModelTokenValue(modelName, maxTokensMap[endpoint as keyof typeof maxTokensMap]);
 }
@@ -753,7 +761,7 @@ export function matchModelName(
   const matchedPattern = findMatchingPattern(modelName, tokensMap);
   if (
     (matchedPattern === 'claude-sonnet-4' || matchedPattern === 'claude-4') &&
-    getAnthropicSonnet46PlusContext(modelName, endpoint) != null
+    getAnthropicContext1m(modelName, endpoint) != null
   ) {
     return modelName;
   }
